@@ -1,0 +1,17 @@
+{
+  "osc": {
+    "unreal_ip": "127.0.0.1",
+    "unreal_port": 8000,
+    "send_rate": 30
+  },
+  "camera": {
+    "camera_id": 0,
+    "width": 1280,
+    "height": 720,
+    "fps": 30
+  },
+  "detection": {
+    "min_area": 1000,
+    "sensitivity": 25
+  }
+}
