@@ -1,19 +1,22 @@
 """
-Système à 2 caméras pour Through the Veil
+Système à 2 caméras pour Through the Veil - AVEC CALIBRATION
 Caméra 1 (Vue de HAUT) : Détecte si la main traverse un seuil (vitre)
 Caméra 0 (Vue de FACE) : S'active quand la main traverse, pour interaction précise
++ HOMOGRAPHIE pour mapper correctement la vitre
 """
 import cv2
 import numpy as np
 import time
+import json
+import os
 from hand_detector import HandDetector
 from config_manager import ConfigManager
 from osc_sender import OSCSender
 
-class DualCameraThreshold:
-    def __init__(self, cam_top_id=1, cam_front_id=0):
+class DualCameraThresholdCalibrated:
+    def __init__(self, cam_top_id=1, cam_front_id=0, calibration_file='calibration.json'):
         print("\n" + "="*60)
-        print("🎭 THROUGH THE VEIL - Dual Camera Threshold System")
+        print("🎭 THROUGH THE VEIL - Dual Camera Threshold System (Calibrated)")
         print("="*60 + "\n")
         
         # Configuration
@@ -42,6 +45,11 @@ class DualCameraThreshold:
             cam.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_config['height'])
             cam.set(cv2.CAP_PROP_FPS, camera_config['fps'])
         
+        # Charge la calibration pour la caméra FRONT
+        self.homography_matrix = None
+        self.calibration_points = None
+        self.load_calibration(calibration_file)
+        
         # État du système
         self.running = False
         self.fps = 0
@@ -64,15 +72,60 @@ class DualCameraThreshold:
         print(f"🎯 Seuil de franchissement: X = {self.threshold_x:.2f}")
         print("✅ Système initialisé\n")
     
+    def load_calibration(self, filepath):
+        """Charge la calibration depuis un fichier JSON"""
+        if not os.path.exists(filepath):
+            print(f"⚠️  Pas de fichier de calibration trouvé : {filepath}")
+            print("   La caméra FRONT fonctionnera sans mapping (coordonnées brutes)")
+            print("   Lance auto_calibration_tool.py pour calibrer")
+            return False
+        
+        try:
+            with open(filepath, 'r') as f:
+                data = json.load(f)
+            
+            self.homography_matrix = np.array(data['homography_matrix'], dtype=np.float32)
+            self.calibration_points = data['calibration_points']
+            
+            print("✅ Calibration chargée pour caméra FRONT !")
+            print(f"   Points de calibration : {self.calibration_points}")
+            return True
+        
+        except Exception as e:
+            print(f"❌ Erreur lors du chargement de la calibration : {e}")
+            return False
+    
     def set_threshold(self, threshold_x):
         """Définit le seuil de franchissement (0.0 à 1.0)"""
         self.threshold_x = max(0.0, min(1.0, threshold_x))
         print(f"🎯 Nouveau seuil: X = {self.threshold_x:.2f}")
     
-    def normalize_position(self, x, y, width, height):
+    def apply_homography(self, x, y, width, height):
+        """Applique l'homographie à un point (x, y) → (u, v)"""
+        if self.homography_matrix is None:
+            # Pas de calibration, retourne les coordonnées brutes normalisées
+            return x / width, y / height
+        
+        # Applique la transformation perspective
+        point = np.array([[[x, y]]], dtype=np.float32)
+        transformed = cv2.perspectiveTransform(point, self.homography_matrix)
+        u, v = transformed[0][0]
+        
+        # Clamp entre 0 et 1
+        u = max(0.0, min(1.0, u))
+        v = max(0.0, min(1.0, v))
+        
+        return u, v
+    
+    def normalize_position(self, x, y, width, height, use_homography=False):
         """Normalise les coordonnées (0.0 à 1.0) avec lissage"""
-        norm_x = x / width
-        norm_y = y / height
+        if use_homography:
+            # Avec homographie (pour caméra FRONT)
+            norm_x, norm_y = self.apply_homography(x, y, width, height)
+        else:
+            # Sans homographie (pour caméra TOP)
+            norm_x = x / width
+            norm_y = y / height
         
         # Applique le lissage
         self.smooth_x = self.smooth_x * self.smoothing + norm_x * (1 - self.smoothing)
@@ -85,9 +138,6 @@ class DualCameraThreshold:
         Vérifie si la main a franchi le seuil
         Retourne True si la main est au-delà du seuil (vers la vitre)
         """
-        # Vous pouvez ajuster la logique selon l'orientation de votre caméra
-        # Par exemple : > threshold si la vitre est à droite
-        # ou < threshold si la vitre est à gauche
         return norm_x > self.threshold_x
     
     def draw_threshold_line(self, frame):
@@ -105,13 +155,47 @@ class DualCameraThreshold:
         
         return frame
     
-    def draw_ui(self, frame, camera_name, num_hands, hands_data, norm_x, norm_y):
+    def draw_calibration_zone(self, frame):
+        """Dessine la zone de calibration sur la frame (caméra FRONT)"""
+        if self.calibration_points is None:
+            return frame
+        
+        # Dessine les points de calibration
+        for i, point in enumerate(self.calibration_points):
+            x, y = int(point[0]), int(point[1])
+            cv2.circle(frame, (x, y), 5, (0, 255, 0), -1)
+            cv2.putText(frame, str(i+1), (x+10, y-10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        
+        # Dessine le quadrilatère
+        points = np.array(self.calibration_points, dtype=np.int32)
+        cv2.polylines(frame, [points], True, (0, 255, 0), 2)
+        
+        return frame
+    
+    def draw_ui(self, frame, camera_name, num_hands, hands_data, norm_x, norm_y, show_calibration=False):
         """Dessine l'interface utilisateur sur la frame"""
         height, width = frame.shape[:2]
+        
+        # Dessine la zone de calibration si demandé
+        if show_calibration:
+            frame = self.draw_calibration_zone(frame)
         
         # Nom de la caméra
         cv2.putText(frame, camera_name, (20, 30),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255, 255, 255), 2)
+        
+        # Calibration status (seulement pour caméra FRONT)
+        if show_calibration:
+            if self.homography_matrix is not None:
+                calib_text = "Calibration: ON"
+                calib_color = (0, 255, 0)
+            else:
+                calib_text = "Calibration: OFF"
+                calib_color = (0, 165, 255)
+            
+            cv2.putText(frame, calib_text, (20, 60),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, calib_color, 1)
         
         # Status main
         if num_hands > 0:
@@ -121,7 +205,8 @@ class DualCameraThreshold:
             status_color = (100, 100, 100)
             status_text = "Pas de main"
         
-        cv2.putText(frame, status_text, (20, 70),
+        y_offset = 90 if show_calibration else 70
+        cv2.putText(frame, status_text, (20, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
         
         # Position si main détectée
@@ -130,19 +215,32 @@ class DualCameraThreshold:
             mode = hand.get('mode', 'erase')
             
             # Info
-            cv2.putText(frame, f"Pos: ({hand['x']}, {hand['y']})", (20, 100),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            y_offset += 30
+            cv2.putText(frame, f"Raw: ({hand['x']}, {hand['y']})", (20, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
             
-            cv2.putText(frame, f"Mode: {mode.upper()}", (20, 125),
+            if show_calibration:
+                y_offset += 25
+                cv2.putText(frame, f"Mapped: ({norm_x:.3f}, {norm_y:.3f})", (20, y_offset),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 0), 2)
+            
+            y_offset += 25
+            cv2.putText(frame, f"Mode: {mode.upper()}", (20, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
             
             # Réticule
-            screen_x = int(norm_x * width)
-            screen_y = int(norm_y * height)
+            raw_x = hand['x']
+            raw_y = hand['y']
             
             color = (255, 0, 0) if mode == "draw" else (0, 0, 255)
-            cv2.circle(frame, (screen_x, screen_y), 20, color, 2)
-            cv2.circle(frame, (screen_x, screen_y), 3, color, -1)
+            cv2.circle(frame, (raw_x, raw_y), 20, color, 2)
+            cv2.circle(frame, (raw_x, raw_y), 3, color, -1)
+            
+            # Affiche les coordonnées UV si calibration
+            if show_calibration and self.homography_matrix is not None:
+                cv2.putText(frame, f"UV: ({norm_x:.2f}, {norm_y:.2f})", 
+                            (raw_x - 80, raw_y - 30),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
         
         # FPS
         cv2.putText(frame, f"FPS: {self.fps:.1f}", (width - 120, 30),
@@ -194,9 +292,9 @@ class DualCameraThreshold:
                 raw_x_top = hand_top['x']
                 raw_y_top = hand_top['y']
                 
-                # Normalise
+                # Normalise SANS homographie (caméra TOP)
                 norm_x_top, norm_y_top = self.normalize_position(
-                    raw_x_top, raw_y_top, width_top, height_top
+                    raw_x_top, raw_y_top, width_top, height_top, use_homography=False
                 )
                 
                 # Vérifie le franchissement
@@ -216,7 +314,8 @@ class DualCameraThreshold:
             # Dessine UI et ligne de seuil
             frame_top = self.draw_threshold_line(frame_top)
             frame_top = self.draw_ui(frame_top, "CAM TOP (Surveillance)", 
-                                      num_hands_top, hands_data_top, norm_x_top, norm_y_top)
+                                      num_hands_top, hands_data_top, norm_x_top, norm_y_top, 
+                                      show_calibration=False)
             
             # Indicateur de franchissement
             if self.hand_crossed_threshold:
@@ -245,12 +344,12 @@ class DualCameraThreshold:
                     mode = hand_front.get('mode', 'erase')
                     confidence = hand_front['confidence']
                     
-                    # Normalise
+                    # Normalise AVEC homographie (caméra FRONT)
                     norm_x_front, norm_y_front = self.normalize_position(
-                        raw_x_front, raw_y_front, width_front, height_front
+                        raw_x_front, raw_y_front, width_front, height_front, use_homography=True
                     )
                     
-                    # Envoie données d'interaction
+                    # Envoie données d'interaction MAPPÉES
                     self.osc.send_custom("/hand/detected", 1)
                     self.osc.send_custom("/hand/position", [float(norm_x_front), float(norm_y_front)])
                     self.osc.send_custom("/hand/mode", 0 if mode == "draw" else 1)
@@ -263,10 +362,11 @@ class DualCameraThreshold:
                     hands_data_front = []
                     num_hands_front = 0
                 
-                # Dessine UI
+                # Dessine UI avec calibration
                 frame_front = self.draw_ui(frame_front, "CAM FRONT (ACTIVE)", 
                                             num_hands_front, hands_data_front, 
-                                            norm_x_front, norm_y_front)
+                                            norm_x_front, norm_y_front,
+                                            show_calibration=True)
                 
                 # Indicateur ACTIF
                 cv2.rectangle(frame_front, (0, 0), (width_front, height_front), (0, 255, 0), 5)
@@ -319,10 +419,10 @@ class DualCameraThreshold:
 
 
 if __name__ == "__main__":
-    # Créer le système
+    # Créer le système avec calibration
     # cam_top_id = 1 (caméra du haut)
     # cam_front_id = 0 (caméra de face)
-    system = DualCameraThreshold(cam_top_id=1, cam_front_id=0)
+    system = DualCameraThresholdCalibrated(cam_top_id=1, cam_front_id=0)
     
     # Ajuster le seuil si nécessaire (0.0 à 1.0)
     # system.set_threshold(0.6)  # Par exemple
