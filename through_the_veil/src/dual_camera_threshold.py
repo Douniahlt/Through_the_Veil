@@ -3,6 +3,7 @@ Système à 2 caméras pour Through the Veil - AVEC CALIBRATION
 Caméra 1 (Vue de HAUT) : Détecte si la main traverse un seuil (vitre)
 Caméra 0 (Vue de FACE) : S'active quand la main traverse, pour interaction précise
 + HOMOGRAPHIE pour mapper correctement la vitre
++ OPTIMISATIONS pour détecter à travers le plexiglass même en faible lumière
 """
 import cv2
 import numpy as np
@@ -16,7 +17,7 @@ from osc_sender import OSCSender
 class DualCameraThresholdCalibrated:
     def __init__(self, cam_top_id=1, cam_front_id=0, calibration_file='calibration.json'):
         print("\n" + "="*60)
-        print("🎭 THROUGH THE VEIL - Dual Camera Threshold System (Calibrated)")
+        print(" THROUGH THE VEIL - Dual Camera Threshold System (Calibrated)")
         print("="*60 + "\n")
         
         # Configuration
@@ -31,12 +32,15 @@ class DualCameraThresholdCalibrated:
         # Caméra 1 : Vue du HAUT (surveillance du seuil)
         self.cam_top = cv2.VideoCapture(cam_top_id)
         self.detector_top = HandDetector(max_hands=1, detection_con=0.6, track_con=0.5)
-        print(f"✅ Caméra 1 (Vue du HAUT) : ID {cam_top_id}")
+        print(f" Caméra 1 (Vue du HAUT) : ID {cam_top_id}")
         
         # Caméra 0 : Vue de FACE (interaction précise)
         self.cam_front = cv2.VideoCapture(cam_front_id)
-        self.detector_front = HandDetector(max_hands=1, detection_con=0.7, track_con=0.5)
-        print(f"✅ Caméra 0 (Vue de FACE) : ID {cam_front_id}")
+        # detection_con TRÈS BAS pour détecter à travers la vitre même avec faible contraste
+        # track_con encore plus bas pour maintenir le tracking même quand la main est floue
+        self.detector_front = HandDetector(max_hands=1, detection_con=0.05, track_con=0.03)
+        print(f" Caméra 0 (Vue de FACE) : ID {cam_front_id}")
+        print(f"    Seuils ultra-bas pour détection à travers plexiglass")
         
         # Configure les caméras
         camera_config = self.config.get('camera')
@@ -44,6 +48,22 @@ class DualCameraThresholdCalibrated:
             cam.set(cv2.CAP_PROP_FRAME_WIDTH, camera_config['width'])
             cam.set(cv2.CAP_PROP_FRAME_HEIGHT, camera_config['height'])
             cam.set(cv2.CAP_PROP_FPS, camera_config['fps'])
+        
+        # Configuration spéciale pour caméra FRONT (optimisée pour plexiglass)
+        # Maximise la luminosité et le contraste pour voir à travers
+        self.cam_front.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)  # Mode manuel
+        self.cam_front.set(cv2.CAP_PROP_EXPOSURE, -2)  # Exposition longue
+        self.cam_front.set(cv2.CAP_PROP_GAIN, 100)  # Gain au maximum
+        self.cam_front.set(cv2.CAP_PROP_BRIGHTNESS, 90)  # Luminosité maximale
+        self.cam_front.set(cv2.CAP_PROP_CONTRAST, 80)  # Contraste élevé
+        self.cam_front.set(cv2.CAP_PROP_SATURATION, 50)  # Saturation moyenne
+        print(" Configuration caméra FRONT optimisée pour plexiglass")
+        
+        # Prétraitement d'image pour améliorer la détection
+        self.use_preprocessing = True
+        self.contrast_alpha = 1.5  # Augmente le contraste
+        self.brightness_beta = 30  # Augmente la luminosité
+        print(f"Prétraitement actif : contrast={self.contrast_alpha}, brightness={self.brightness_beta}")
         
         # Charge la calibration pour la caméra FRONT
         self.homography_matrix = None
@@ -64,18 +84,21 @@ class DualCameraThresholdCalibrated:
         self.hand_crossed_threshold = False
         self.front_camera_active = False
         
-        # Lissage de position
-        self.smoothing = 0.3
+        # Lissage de position (plus fort pour compenser l'instabilité)
+        self.smoothing = 0.4  # Lissage augmenté pour stabiliser
         self.smooth_x = 0.5
         self.smooth_y = 0.5
         
-        print(f"🎯 Seuil de franchissement: X = {self.threshold_x:.2f}")
-        print("✅ Système initialisé\n")
+        # Compteur de frames sans détection (pour debug/info seulement)
+        self.frames_without_detection = 0
+        
+        print(f" Seuil de franchissement: X = {self.threshold_x:.2f}")
+        print(" Système initialisé\n")
     
     def load_calibration(self, filepath):
         """Charge la calibration depuis un fichier JSON"""
         if not os.path.exists(filepath):
-            print(f"⚠️  Pas de fichier de calibration trouvé : {filepath}")
+            print(f"  Pas de fichier de calibration trouvé : {filepath}")
             print("   La caméra FRONT fonctionnera sans mapping (coordonnées brutes)")
             print("   Lance auto_calibration_tool.py pour calibrer")
             return False
@@ -87,18 +110,75 @@ class DualCameraThresholdCalibrated:
             self.homography_matrix = np.array(data['homography_matrix'], dtype=np.float32)
             self.calibration_points = data['calibration_points']
             
-            print("✅ Calibration chargée pour caméra FRONT !")
+            print(" Calibration chargée pour caméra FRONT !")
             print(f"   Points de calibration : {self.calibration_points}")
             return True
         
         except Exception as e:
-            print(f"❌ Erreur lors du chargement de la calibration : {e}")
+            print(f" Erreur lors du chargement de la calibration : {e}")
             return False
+    
+    def preprocess_frame(self, frame):
+        """
+        Prétraite l'image pour améliorer la détection à travers le plexiglass
+        - Augmente le contraste
+        - Améliore la luminosité
+        - Applique un léger flou pour réduire le bruit
+        """
+        if not self.use_preprocessing:
+            return frame
+        
+        # Conversion en LAB pour manipulation de luminosité
+        lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        
+        # Égalisation adaptative d'histogramme (CLAHE) sur le canal L
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8,8))
+        l_enhanced = clahe.apply(l)
+        
+        # Recompose l'image
+        enhanced_lab = cv2.merge([l_enhanced, a, b])
+        enhanced = cv2.cvtColor(enhanced_lab, cv2.COLOR_LAB2BGR)
+        
+        # Ajustement supplémentaire de contraste et luminosité
+        enhanced = cv2.convertScaleAbs(enhanced, alpha=self.contrast_alpha, beta=self.brightness_beta)
+        
+        # Léger flou gaussien pour réduire le bruit
+        enhanced = cv2.GaussianBlur(enhanced, (3, 3), 0)
+        
+        return enhanced
     
     def set_threshold(self, threshold_x):
         """Définit le seuil de franchissement (0.0 à 1.0)"""
         self.threshold_x = max(0.0, min(1.0, threshold_x))
-        print(f"🎯 Nouveau seuil: X = {self.threshold_x:.2f}")
+        print(f" Nouveau seuil: X = {self.threshold_x:.2f}")
+    
+    def toggle_preprocessing(self):
+        """Active/désactive le prétraitement"""
+        self.use_preprocessing = not self.use_preprocessing
+        status = "ON" if self.use_preprocessing else "OFF"
+        print(f" Prétraitement : {status}")
+    
+    def adjust_contrast(self, delta):
+        """Ajuste le contraste du prétraitement"""
+        self.contrast_alpha = max(0.5, min(3.0, self.contrast_alpha + delta))
+        print(f" Contraste : {self.contrast_alpha:.2f}")
+    
+    def adjust_brightness(self, delta):
+        """Ajuste la luminosité du prétraitement"""
+        self.brightness_beta = max(-100, min(100, self.brightness_beta + delta))
+        print(f" Luminosité : {self.brightness_beta}")
+    
+    def is_point_in_calibration_zone(self, x, y):
+        """Vérifie si un point (x, y) est dans la zone de calibration"""
+        if self.calibration_points is None:
+            # Pas de calibration, accepte tous les points
+            return True
+        
+        # Utilise pointPolygonTest de OpenCV
+        points = np.array(self.calibration_points, dtype=np.int32)
+        result = cv2.pointPolygonTest(points, (float(x), float(y)), False)
+        return result >= 0  # >= 0 signifie dans ou sur le contour
     
     def apply_homography(self, x, y, width, height):
         """Applique l'homographie à un point (x, y) → (u, v)"""
@@ -117,7 +197,7 @@ class DualCameraThresholdCalibrated:
         
         return u, v
     
-    def normalize_position(self, x, y, width, height, use_homography=False):
+    def normalize_position(self, x, y, width, height, use_homography=False, flip_x=False):
         """Normalise les coordonnées (0.0 à 1.0) avec lissage"""
         if use_homography:
             # Avec homographie (pour caméra FRONT)
@@ -126,6 +206,10 @@ class DualCameraThresholdCalibrated:
             # Sans homographie (pour caméra TOP)
             norm_x = x / width
             norm_y = y / height
+            
+            # Inverse l'axe X si la caméra est de côté
+            if flip_x:
+                norm_x = 1.0 - norm_x
         
         # Applique le lissage
         self.smooth_x = self.smooth_x * self.smoothing + norm_x * (1 - self.smoothing)
@@ -196,16 +280,22 @@ class DualCameraThresholdCalibrated:
             
             cv2.putText(frame, calib_text, (20, 60),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, calib_color, 1)
+            
+            # Prétraitement status
+            preproc_text = f"Preproc: {'ON' if self.use_preprocessing else 'OFF'}"
+            preproc_color = (0, 255, 0) if self.use_preprocessing else (100, 100, 100)
+            cv2.putText(frame, preproc_text, (20, 85),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, preproc_color, 1)
         
         # Status main
         if num_hands > 0:
             status_color = (0, 255, 0)
-            status_text = "✓ MAIN"
+            status_text = "✓ MAIN DETECTEE"
         else:
             status_color = (100, 100, 100)
             status_text = "Pas de main"
         
-        y_offset = 90 if show_calibration else 70
+        y_offset = 115 if show_calibration else 70
         cv2.putText(frame, status_text, (20, y_offset),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.7, status_color, 2)
         
@@ -213,6 +303,7 @@ class DualCameraThresholdCalibrated:
         if num_hands > 0:
             hand = hands_data[0]
             mode = hand.get('mode', 'erase')
+            confidence = hand.get('confidence', 0.0)
             
             # Info
             y_offset += 30
@@ -227,6 +318,11 @@ class DualCameraThresholdCalibrated:
             y_offset += 25
             cv2.putText(frame, f"Mode: {mode.upper()}", (20, y_offset),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+            
+            y_offset += 25
+            conf_color = (0, 255, 0) if confidence > 0.5 else (0, 165, 255) if confidence > 0.2 else (0, 0, 255)
+            cv2.putText(frame, f"Conf: {confidence:.2f}", (20, y_offset),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, conf_color, 1)
             
             # Réticule
             raw_x = hand['x']
@@ -264,21 +360,23 @@ class DualCameraThresholdCalibrated:
         # Fenêtres
         cv2.namedWindow('Camera TOP (Surveillance)')
         cv2.namedWindow('Camera FRONT (Interaction)')
+        cv2.namedWindow('Camera FRONT (Raw)')  # Pour voir l'image brute
         
-        print("\n🚀 SYSTÈME DÉMARRÉ")
+        print("\n SYSTÈME DÉMARRÉ")
         print("="*60)
         print("CONTRÔLES:")
         print("  q - Quitter")
-        print("  r - Reset détecteurs")
-        print("  + - Augmenter seuil")
-        print("  - - Diminuer seuil")
+        print("  + / - - Ajuster seuil")
+        print("  p - Toggle prétraitement")
+        print("  c / v - Ajuster contraste")
+        print("  b / n - Ajuster luminosité")
         print("="*60 + "\n")
         
         while self.running:
             # ===== CAMÉRA TOP (Vue du haut - surveillance) =====
             ret_top, frame_top = self.cam_top.read()
             if not ret_top:
-                print("❌ Erreur caméra TOP")
+                print(" Erreur caméra TOP")
                 break
             
             height_top, width_top = frame_top.shape[:2]
@@ -292,9 +390,9 @@ class DualCameraThresholdCalibrated:
                 raw_x_top = hand_top['x']
                 raw_y_top = hand_top['y']
                 
-                # Normalise SANS homographie (caméra TOP)
+                # Normalise SANS homographie (caméra TOP) avec inversion X (caméra de côté)
                 norm_x_top, norm_y_top = self.normalize_position(
-                    raw_x_top, raw_y_top, width_top, height_top, use_homography=False
+                    raw_x_top, raw_y_top, width_top, height_top, use_homography=False, flip_x=True
                 )
                 
                 # Vérifie le franchissement
@@ -323,24 +421,34 @@ class DualCameraThresholdCalibrated:
                             cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 3)
             
             # ===== CAMÉRA FRONT (Vue de face - interaction) =====
-            ret_front, frame_front = self.cam_front.read()
+            ret_front, frame_front_raw = self.cam_front.read()
             if not ret_front:
-                print("❌ Erreur caméra FRONT")
+                print(" Erreur caméra FRONT")
                 break
             
-            height_front, width_front = frame_front.shape[:2]
+            # Garde une copie de l'image brute pour l'affichage
+            frame_front_display = frame_front_raw.copy()
             
-            # Active la caméra FRONT seulement si seuil franchi
-            if self.hand_crossed_threshold:
-                self.front_camera_active = True
+            # Prétraite l'image pour la détection
+            frame_front_processed = self.preprocess_frame(frame_front_raw)
+            
+            height_front, width_front = frame_front_processed.shape[:2]
+            
+            # La caméra FRONT est TOUJOURS ACTIVE et contrôle les mouvements
+            self.front_camera_active = True
+            
+            # Détection sur caméra FRONT (avec image prétraitée)
+            num_hands_front, hands_data_front = self.detector_front.detect(frame_front_processed)
+            hand_in_zone = False
+            
+            if num_hands_front > 0:
+                hand_front = hands_data_front[0]
+                raw_x_front = hand_front['x']
+                raw_y_front = hand_front['y']
                 
-                # Détection sur caméra FRONT
-                num_hands_front, hands_data_front = self.detector_front.detect(frame_front)
-                
-                if num_hands_front > 0:
-                    hand_front = hands_data_front[0]
-                    raw_x_front = hand_front['x']
-                    raw_y_front = hand_front['y']
+                # Vérifie que la main est dans la zone de calibration
+                if self.is_point_in_calibration_zone(raw_x_front, raw_y_front):
+                    hand_in_zone = True
                     mode = hand_front.get('mode', 'erase')
                     confidence = hand_front['confidence']
                     
@@ -355,40 +463,47 @@ class DualCameraThresholdCalibrated:
                     self.osc.send_custom("/hand/mode", 0 if mode == "draw" else 1)
                     self.osc.send_custom("/hand/radius", 0.02 if mode == "draw" else 0.15)
                     self.osc.send_custom("/hand/confidence", float(confidence))
+                    
+                    # Reset compteur de frames sans détection
+                    self.frames_without_detection = 0
                 else:
+                    # Main détectée mais hors de la zone calibrée
                     self.osc.send_custom("/hand/detected", 0)
                     norm_x_front = self.smooth_x
                     norm_y_front = self.smooth_y
-                    hands_data_front = []
-                    num_hands_front = 0
-                
-                # Dessine UI avec calibration
-                frame_front = self.draw_ui(frame_front, "CAM FRONT (ACTIVE)", 
-                                            num_hands_front, hands_data_front, 
-                                            norm_x_front, norm_y_front,
-                                            show_calibration=True)
-                
-                # Indicateur ACTIF
-                cv2.rectangle(frame_front, (0, 0), (width_front, height_front), (0, 255, 0), 5)
+                    self.frames_without_detection += 1
             else:
-                # Caméra FRONT inactive
-                self.front_camera_active = False
                 self.osc.send_custom("/hand/detected", 0)
-                
-                # Overlay "INACTIVE"
-                overlay = frame_front.copy()
-                cv2.rectangle(overlay, (0, 0), (width_front, height_front), (50, 50, 50), -1)
-                frame_front = cv2.addWeighted(frame_front, 0.3, overlay, 0.7, 0)
-                
-                cv2.putText(frame_front, "CAMERA INACTIVE", (width_front//2 - 200, height_front//2),
-                            cv2.FONT_HERSHEY_SIMPLEX, 1.2, (100, 100, 100), 3)
-                cv2.putText(frame_front, "Franchissez le seuil pour activer", 
-                            (width_front//2 - 250, height_front//2 + 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 2)
+                norm_x_front = self.smooth_x
+                norm_y_front = self.smooth_y
+                hands_data_front = []
+                self.frames_without_detection += 1
             
-            # Affiche les deux frames
+            # Avertissement si pas de détection pendant longtemps (mais pas de reset)
+            if self.frames_without_detection == 60:
+                print("  Pas de détection depuis 2 secondes...")
+                print("   → Vérifie que la main est bien visible")
+                print("   → Ajuste le prétraitement avec C/V/B/N")
+            elif self.frames_without_detection == 150:
+                print("  Toujours pas de détection (5 secondes)...")
+                print("   → Si ça persiste, relance le programme (q puis relance)")
+            
+            # Dessine UI sur l'image prétraitée (pour feedback)
+            cam_status = "CAM FRONT - Main dans zone" if hand_in_zone else "CAM FRONT - En attente"
+            frame_front_display = self.draw_ui(frame_front_display, cam_status, 
+                                        num_hands_front if hand_in_zone else 0, 
+                                        hands_data_front if hand_in_zone else [], 
+                                        norm_x_front, norm_y_front,
+                                        show_calibration=True)
+            
+            # Indicateur : vert si main dans zone, orange sinon
+            border_color = (0, 255, 0) if hand_in_zone else (255, 165, 0)
+            cv2.rectangle(frame_front_display, (0, 0), (width_front, height_front), border_color, 5)
+            
+            # Affiche les trois frames
             cv2.imshow('Camera TOP (Surveillance)', frame_top)
-            cv2.imshow('Camera FRONT (Interaction)', frame_front)
+            cv2.imshow('Camera FRONT (Interaction)', frame_front_display)
+            cv2.imshow('Camera FRONT (Raw)', frame_front_raw)
             
             # FPS
             self.frame_count += 1
@@ -398,24 +513,30 @@ class DualCameraThresholdCalibrated:
             key = cv2.waitKey(1) & 0xFF
             if key == ord('q'):
                 break
-            elif key == ord('r'):
-                self.detector_top.reset()
-                self.detector_front.reset()
-                print("🔄 Détecteurs réinitialisés")
             elif key == ord('+') or key == ord('='):
                 self.set_threshold(self.threshold_x + 0.05)
             elif key == ord('-') or key == ord('_'):
                 self.set_threshold(self.threshold_x - 0.05)
+            elif key == ord('p'):
+                self.toggle_preprocessing()
+            elif key == ord('c'):
+                self.adjust_contrast(0.1)
+            elif key == ord('v'):
+                self.adjust_contrast(-0.1)
+            elif key == ord('b'):
+                self.adjust_brightness(5)
+            elif key == ord('n'):
+                self.adjust_brightness(-5)
         
         self.cleanup()
     
     def cleanup(self):
         """Nettoyage"""
-        print("\n🧹 Nettoyage...")
+        print("\n Nettoyage...")
         self.cam_top.release()
         self.cam_front.release()
         cv2.destroyAllWindows()
-        print("✅ Terminé")
+        print(" Terminé")
 
 
 if __name__ == "__main__":

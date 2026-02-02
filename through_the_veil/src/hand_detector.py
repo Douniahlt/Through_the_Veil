@@ -9,27 +9,34 @@ class HandDetector:
         Initialise le modèle MediaPipe Hands avec l'API tasks (0.10+).
         """
         self.max_hands = max_hands
+        self.detection_con = detection_con
+        self.track_con = track_con
         
         # Chemin du modèle
-        model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
+        self.model_path = os.path.join(os.path.dirname(__file__), 'hand_landmarker.task')
         
+        # Initialise le détecteur
+        self._create_detector()
+        
+        # Indices des points pour calculer le centre de la paume (Barycentre)
+        # 0: Poignet, 5: Index (racine), 17: Auriculaire (racine)
+        self.palm_indices = [0, 5, 17]
+
+    def _create_detector(self):
+        """Crée un nouveau détecteur MediaPipe"""
         # Configuration avec la nouvelle API tasks
-        base_options = mp.tasks.BaseOptions(model_asset_path=model_path)
+        base_options = mp.tasks.BaseOptions(model_asset_path=self.model_path)
         options = mp.tasks.vision.HandLandmarkerOptions(
             base_options=base_options,
-            num_hands=max_hands,
-            min_hand_detection_confidence=detection_con,
-            min_hand_presence_confidence=detection_con,
-            min_tracking_confidence=track_con,
+            num_hands=self.max_hands,
+            min_hand_detection_confidence=self.detection_con,
+            min_hand_presence_confidence=self.detection_con,
+            min_tracking_confidence=self.track_con,
             running_mode=mp.tasks.vision.RunningMode.VIDEO
         )
         
         self.detector = mp.tasks.vision.HandLandmarker.create_from_options(options)
         self.frame_timestamp_ms = 0
-        
-        # Indices des points pour calculer le centre de la paume (Barycentre)
-        # 0: Poignet, 5: Index (racine), 17: Auriculaire (racine)
-        self.palm_indices = [0, 5, 17]
 
     def detect_finger_mode(self, hand_landmarks):
         """
@@ -40,26 +47,35 @@ class HandDetector:
             (mode, position_landmark_index)
             mode: "draw" ou "erase"
         """
-        # Landmarks clés
-        index_tip = hand_landmarks[8]      # Bout index
-        index_mcp = hand_landmarks[5]      # Base index
-        middle_tip = hand_landmarks[12]    # Bout majeur
-        middle_mcp = hand_landmarks[9]     # Base majeur
-        ring_tip = hand_landmarks[16]      # Bout annulaire
-        ring_mcp = hand_landmarks[13]      # Base annulaire
+        try:
+            # Vérifie qu'on a assez de landmarks
+            if len(hand_landmarks) < 21:
+                return "erase", None
+            
+            # Landmarks clés
+            index_tip = hand_landmarks[8]      # Bout index
+            index_mcp = hand_landmarks[5]      # Base index
+            middle_tip = hand_landmarks[12]    # Bout majeur
+            middle_mcp = hand_landmarks[9]     # Base majeur
+            ring_tip = hand_landmarks[16]      # Bout annulaire
+            ring_mcp = hand_landmarks[13]      # Base annulaire
+            
+            # Vérifie si index est TENDU (bout plus haut que base)
+            index_extended = index_tip.y < index_mcp.y - 0.03
+            
+            # Vérifie si les autres doigts sont REPLIÉS (bout plus bas que base)
+            middle_folded = middle_tip.y > middle_mcp.y + 0.02
+            ring_folded = ring_tip.y > ring_mcp.y + 0.02
+            
+            # Mode DESSIN : index seul tendu
+            if index_extended and middle_folded and ring_folded:
+                return "draw", 8  # Landmark 8 = bout index
+            else:
+                # Mode EFFACEMENT : main ouverte, on garde le barycentre
+                return "erase", None
         
-        # Vérifie si index est TENDU (bout plus haut que base)
-        index_extended = index_tip.y < index_mcp.y - 0.03
-        
-        # Vérifie si les autres doigts sont REPLIÉS (bout plus bas que base)
-        middle_folded = middle_tip.y > middle_mcp.y + 0.02
-        ring_folded = ring_tip.y > ring_mcp.y + 0.02
-        
-        # Mode DESSIN : index seul tendu
-        if index_extended and middle_folded and ring_folded:
-            return "draw", 8  # Landmark 8 = bout index
-        else:
-            # Mode EFFACEMENT : main ouverte, on garde le barycentre
+        except (IndexError, AttributeError) as e:
+            # En cas d'erreur, mode effacement par défaut
             return "erase", None
 
     def detect(self, frame, draw=True):
@@ -70,9 +86,9 @@ class HandDetector:
         img_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=img_rgb)
         
-        # Détection avec timestamp
+        # Détection avec timestamp (IMPORTANT : toujours incrémenter)
         results = self.detector.detect_for_video(mp_image, self.frame_timestamp_ms)
-        self.frame_timestamp_ms += 33
+        self.frame_timestamp_ms += 33  # Incrémente TOUJOURS (même en cas d'erreur)
 
         hands_data = []
         h, w, c = frame.shape
@@ -85,30 +101,49 @@ class HandDetector:
                 
                 if mode == "draw":
                     # MODE DESSIN : Position de l'index
-                    index_tip = hand_landmarks[8]
-                    center_x_norm = index_tip.x
-                    center_y_norm = index_tip.y
-                    px = int(center_x_norm * w)
-                    py = int(center_y_norm * h)
-                else:
-                    # MODE EFFACEMENT : Barycentre de la paume (ton code actuel)
-                    x_coords = [hand_landmarks[i].x for i in self.palm_indices]
-                    y_coords = [hand_landmarks[i].y for i in self.palm_indices]
-                    center_x_norm = np.mean(x_coords)
-                    center_y_norm = np.mean(y_coords)
-                    px = int(center_x_norm * w)
-                    py = int(center_y_norm * h)
+                    try:
+                        index_tip = hand_landmarks[8]
+                        center_x_norm = index_tip.x
+                        center_y_norm = index_tip.y
+                        px = int(center_x_norm * w)
+                        py = int(center_y_norm * h)
+                    except (IndexError, AttributeError):
+                        # Si erreur, utilise le barycentre comme fallback
+                        mode = "erase"
                 
-                # Confiance
+                if mode == "erase":
+                    # MODE EFFACEMENT : Barycentre de la paume
+                    try:
+                        x_coords = [hand_landmarks[i].x for i in self.palm_indices if i < len(hand_landmarks)]
+                        y_coords = [hand_landmarks[i].y for i in self.palm_indices if i < len(hand_landmarks)]
+                        
+                        if len(x_coords) > 0 and len(y_coords) > 0:
+                            center_x_norm = np.mean(x_coords)
+                            center_y_norm = np.mean(y_coords)
+                            px = int(center_x_norm * w)
+                            py = int(center_y_norm * h)
+                        else:
+                            # Pas assez de landmarks, skip cette main
+                            continue
+                    except (IndexError, AttributeError):
+                        # Si erreur, skip cette main
+                        continue
+                
+                # Confiance (avec vérification sécurisée)
                 confidence = 1.0
-                if results.handedness and idx < len(results.handedness):
-                    confidence = results.handedness[idx][0].score
+                try:
+                    if results.handedness and len(results.handedness) > idx:
+                        if len(results.handedness[idx]) > 0:
+                            confidence = results.handedness[idx][0].score
+                except (IndexError, AttributeError):
+                    # Si erreur d'accès, garde confiance à 1.0
+                    pass
 
                 hands_data.append({
                     'x': px,
                     'y': py,
                     'confidence': confidence,
-                    'mode': mode,              # NOUVEAU : "draw" ou "erase"
+                    'mode': mode,              # "draw" ou "erase"
                     'landmarks': hand_landmarks
                 })
 
@@ -151,6 +186,18 @@ class HandDetector:
         return len(hands_data), hands_data
 
     def reset(self):
-        """Réinitialise le tracker si besoin (utile si lag)"""
-        # Réinitialise le timestamp
-        self.frame_timestamp_ms = 0
+        """
+        Réinitialise complètement le détecteur MediaPipe.
+        ATTENTION : Cette méthode recrée le détecteur, ce qui prend du temps.
+        Utilisez-la avec parcimonie !
+        """
+        print(" Reset du détecteur : recréation complète...")
+        try:
+            # Ferme l'ancien détecteur
+            self.detector.close()
+        except:
+            pass
+        
+        # Recrée un nouveau détecteur avec timestamp à 0
+        self._create_detector()
+        print(" Détecteur recréé")
